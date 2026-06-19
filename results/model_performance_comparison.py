@@ -53,35 +53,38 @@ PRODUCTS = list(FILES.keys()) # MyKey
 # Users must provide their own continuous futures datasets.
 
 # 백테스트 파라미터 (동일 파라미터)
-WINDOW = 100
-COST = 0.0004
-ATR_LEN = 14
-BB_LENGTH = 20
-STOP_ATR = 4.0
-MOM_LOOKBACK = 10
-V1_VR_LOWER = 0.95
-V1_VR_UPPER = 1.05
-V1_TRAIL_ATR = 3.0
+WINDOW = 100        # Regime 안정성 확보 - short-term noise 제거 목적.
+COST = 0.0004       # 지수 선물 수수료 (왕복값)   
+ATR_LEN = 14        # ATR 길이
+BB_LENGTH = 20      # 볼린저밴드 길이 
+STOP_ATR = 4.0      # TAIL-RISK 최소화
+MOM_LOOKBACK = 10   # 모멘텀 전략 기준
+V1_VR_LOWER = 0.95  # MEAN-REVERSION / TREND 구간 분리 기준1
+V1_VR_UPPER = 1.05  # MEAN-REVERSION / TREND 구간 분리 기준2
+V1_TRAIL_ATR = 3.0  
 V4_TRAIL_MOM = 3.0
 
-SHORT_Q = [2, 3, 4, 6, 8]
-LONG_Q = [10, 16, 21, 25, 30]
-Q_LIST = SHORT_Q + LONG_Q
-ROLL_Q = 800
+SHORT_Q = [2, 3, 4, 6, 8]      # q=1 : 4시간봉, q=2: 8시간봉 (단기봉 기준)  
+LONG_Q = [10, 16, 21, 25, 30]  # 장기봉 기준
+Q_LIST = SHORT_Q + LONG_Q      # 샘플 추가 목적.
+ROLL_Q = 800                   """ regime 시장 상태 설명 위해 긴 기간 설정. + 작은 윈도우에서 노이즈 거르기 위함.
+                               This is not a tuned hyperparameter but a structural sample size chosen to ensure that stable distributional estimation of VR across multi-q-values, and that reduced sensibility to short-term microstructure noise,
+                               and that regime classification robustness under the non-stationary conditions. """
 
-BBW_PERCENTILE_WINDOW = 100
-EXPANSION_Q = 0.80
-BAND_WALK_BARS = 5
-BAND_WALK_THRESHOLD = 3
-BAND_WALK_SIGMA = 1.5
+# BBW Regime Filter Layer (for Momentum Strategy) 
+BBW_PERCENTILE_WINDOW = 100    # Percentile 안정 구간 - REGIME SWITCHING 기준 단기/중기 변동성 분포가 균형된 구간. (노이즈 X, LAG 적음)
+EXPANSION_Q = 0.80             # BBW 기준 상위 20% 구간 for Regime Detection and signal frequency.
+BAND_WALK_BARS = 5             # 더 긴 봉 구간 늘리기 가능. (5개 기준 - directional pressure 확인 가능하다 생각함.)
+BAND_WALK_THRESHOLD = 3        # score threshold임. 3점 정도면 persistence okay!
+BAND_WALK_SIGMA = 1.5          # Midpoint for Volatility-Normalized Activation Threshold. 
 
 # Forward 경계
-TRAIN_END = pd.Timestamp("2025-04-03 23:59:59")
-TEST_START = pd.Timestamp("2025-04-04")
+TRAIN_END = pd.Timestamp("2025-04-03 23:59:59")    # 학습 기간 (2018년 to 2025년)
+TEST_START = pd.Timestamp("2025-04-04")            # 테스트 시작 기간.
 
 # ML
-THRESHOLD = 0.60
-SEEDS = [10, 100, 1000, 10000, 100000] # Seed-Robustness Validation.
+THRESHOLD = 0.60      # edge가 보통 0.5 이상에서 나옴. 하지만, 0.55 to 0.6은 weakness함. 또한, false positive entry를 줄이기 위함임. 
+SEEDS = [10, 100, 1000, 10000, 100000]   # For Seed-Robustness Validation. (Multi-Seeds) 
 
 
 def variance_ratio(prices, q):
@@ -89,10 +92,25 @@ def variance_ratio(prices, q):
     if n < q + 1: return np.nan
     mu = np.mean(rets); var_1 = np.sum((rets - mu) ** 2) / n
     if var_1 == 0: return np.nan
-    q_rets = log_p[q:] - log_p[:-q]
-    return np.sum((q_rets - q * mu) ** 2) / (n * q) / var_1
+    q_rets = log_p[q:] - log_p[:-q] # variance reduction + smoothing, 
+    return np.sum((q_rets - q * mu) ** 2) / (n * q) / var_1 # normal 구조. 
+
+    # It's for detect momentum and mean reversion regimes. 
+    """ VR 에서 1이 의미하는 것:
+    VR = 1 : 랜덤 워크, NO Auto-correlated
+    VR > 1 : Momentum / Trend Persistence
+    VR < 1 : Mean Reversion 
+    """
 
 
+# Multi-layer market state encoder.
+
+""" 4차원 레짐 분해 
+Layer 1 : 변동성 레짐 - bbw + expansion
+Layer 2 : 추세 지속 - band walk
+Layer 3 : 유효성 구조 - VR (multi-q-values)
+Layer 4 : 레짐 정규화 - rolling quantiles of vr_score. 
+"""
 def prep(df):
     df = df.copy().sort_values("datetime").reset_index(drop=True)
     df["ma"] = df["close"].rolling(BB_LENGTH).mean()
@@ -127,7 +145,13 @@ def prep(df):
     df["q40"] = df["vr_score"].rolling(ROLL_Q).quantile(0.40)
     df["q60"] = df["vr_score"].rolling(ROLL_Q).quantile(0.60)
     df["q80"] = df["vr_score"].rolling(ROLL_Q).quantile(0.80)
-    
+
+
+  # 앞 내용 바탕으로 실전 트레이딩 입력 코드. 
+  # vr_score to 5개 구간: strong_mom, mom, neutral, rev, and strong_rev. 
+  # 한마디로, 연속적 regime 을 이산적인 시장 상태로 변환 후 다중 시점 모멘텀, 평균 회귀 거리, 시계열 구조 결합 => ML 활용.
+  # 변동성 정규화 특성 공간 구축
+
     def reg5(row):
         if pd.isna(row["q20"]): return "neutral"
         s = row["vr_score"]
@@ -188,7 +212,7 @@ def extract_features(row, product, source_model, direction, entry_type):
         "hour_of_day": row["hour_of_day"], "day_of_week": row["day_of_week"],
     }
 
-
+"""모델 1 (V1)"""
 def model_v1(df, product):
     pos, ep, sp, trail, m_pos = 0, 0.0, None, None, None
     entry_feat = None; trades = []
@@ -246,7 +270,7 @@ def model_v1(df, product):
             trades.append(entry_feat); pos = 0; entry_feat = None
     return trades
 
-
+"""모델 4 (V4)"""
 def model_v4(df, product):
     pos, ep, sp, trail, m_pos, entry_reg = 0, 0.0, None, None, None, None
     entry_feat = None; trades = []
@@ -304,7 +328,7 @@ def model_v4(df, product):
             trades.append(entry_feat); pos = 0; entry_feat = None; entry_reg = None
     return trades
 
-
+# XGBOOST 모델
 def get_xgb(seed):
     if USE_XGB:
         return XGBClassifier(n_estimators=200, max_depth=4, learning_rate=0.05,
@@ -327,7 +351,7 @@ def stats(df_trades):
     return dict(n=n, sharpe=sharpe, mdd=mdd, total=total,
                 win_rate=(rets > 0).mean() * 100)
 
-
+# 메인 코드
 def main():
     print("=" * 90)
     print(" Forward Validation — 2018-04-04 ~ 2025-04-03")
@@ -343,7 +367,7 @@ def main():
     for product, fn in FILES.items():
         path = os.path.join(DATA_DIR, fn)
         if not os.path.exists(path):
-            print(f"  ⚠ {path} 없음, 건너뜀"); continue
+            print(f"  {path} 없음, 건너뜀"); continue
         df = pd.read_csv(path, parse_dates=["datetime"])
         data = prep(df)
         print(f"  {product}: {len(data):,}봉, "
@@ -367,7 +391,7 @@ def main():
     print(f"  v4: Train {len(v4_train)}, Test {len(v4_test)}")
     
     if len(v1_test) == 0 and len(v4_test) == 0:
-        print("\n  ⚠ Test 거래 없음. 데이터 확인 필요")
+        print("\n  Test 거래 없음. 데이터 확인 필요")
         return
     
     # 3. Feature 준비
