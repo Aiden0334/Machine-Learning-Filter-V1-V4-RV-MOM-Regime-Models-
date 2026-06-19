@@ -1,1 +1,434 @@
+"""
+═══════════════════════════════════════════════════════════════════
+  Feature Engineering — ML IS DATASET Making
+═══════════════════════════════════════════════════════════════════
+## 목적
+  v1, v4 거래의 진입 시점 feature와 결과 라벨 추출
+  ES/NQ/YM/RTY 4종목 통합
 
+## 출력
+  /ml/features.csv
+  컬럼: 식별자 + Feature(약 25-30개) + 라벨
+
+## Feature 그룹
+  A. VR 레짐 (vr_16, vr_30, vr_score, regime5 one-hot)
+  B. 변동성 (atr, bbw, is_expansion, walk, rolling_std)
+  C. 가격 위치/모멘텀 (bb_position, dist_ma, mom_5/10/20)
+  D. 시간 (hour, day_of_week)
+
+## 라벨
+  y = 1 if trade_return > 0 else 0
+═══════════════════════════════════════════════════════════════════
+"""
+
+import pandas as pd
+import numpy as np
+import os
+
+DATA_DIR = "./futures_data"
+OUTPUT_DIR = "./ml"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+FILES = {
+    "ES": "ES_4h_continuous.csv",
+    "NQ": "NQ_4h_continuous.csv",
+    "YM": "YM_4h_continuous.csv",
+    "RTY": "RTY_4h_continuous.csv",
+}
+PRODUCTS = list(FILES.keys())
+
+WINDOW = 100
+COST = 0.0004
+ATR_LEN = 14
+BB_LENGTH = 20
+STOP_ATR = 4.0
+MOM_LOOKBACK = 10
+V1_VR_LOWER = 0.95
+V1_VR_UPPER = 1.05
+V1_TRAIL_ATR = 3.0
+V4_TRAIL_MOM = 3.0
+
+SHORT_Q = [2, 3, 4, 6, 8]
+LONG_Q = [10, 16, 21, 25, 30]
+Q_LIST = SHORT_Q + LONG_Q
+ROLL_Q = 800
+
+BBW_PERCENTILE_WINDOW = 100
+EXPANSION_Q = 0.80
+BAND_WALK_BARS = 5
+BAND_WALK_THRESHOLD = 3
+BAND_WALK_SIGMA = 1.5
+
+
+def variance_ratio(prices, q):
+    log_p = np.log(prices); rets = np.diff(log_p); n = len(rets)
+    if n < q + 1: return np.nan
+    mu = np.mean(rets); var_1 = np.sum((rets - mu) ** 2) / n
+    if var_1 == 0: return np.nan
+    q_rets = log_p[q:] - log_p[:-q]
+    return np.sum((q_rets - q * mu) ** 2) / (n * q) / var_1
+
+
+def prep(df):
+    """기본 prep + ML feature 계산"""
+    df = df.copy().sort_values("datetime").reset_index(drop=True)
+    
+    # BB
+    df["ma"] = df["close"].rolling(BB_LENGTH).mean()
+    df["std"] = df["close"].rolling(BB_LENGTH).std()
+    df["upper_2"] = df["ma"] + 2.0 * df["std"]
+    df["lower_2"] = df["ma"] - 2.0 * df["std"]
+    df["upper_walk"] = df["ma"] + BAND_WALK_SIGMA * df["std"]
+    df["lower_walk"] = df["ma"] - BAND_WALK_SIGMA * df["std"]
+    
+    # BBW
+    df["bbw"] = (df["upper_2"] - df["lower_2"]) / df["ma"]
+    df["bbw_high_th"] = df["bbw"].rolling(BBW_PERCENTILE_WINDOW).quantile(EXPANSION_Q)
+    df["is_expansion"] = (df["bbw"] > df["bbw_high_th"]).astype(int)
+    df["bbw_percentile"] = df["bbw"].rolling(BBW_PERCENTILE_WINDOW).rank(pct=True)
+    
+    # Band walking
+    above = (df["close"] > df["upper_walk"]).astype(int)
+    below = (df["close"] < df["lower_walk"]).astype(int)
+    df["walk_up"] = (above.rolling(BAND_WALK_BARS).sum() >= BAND_WALK_THRESHOLD).astype(int)
+    df["walk_down"] = (below.rolling(BAND_WALK_BARS).sum() >= BAND_WALK_THRESHOLD).astype(int)
+    
+    # VR
+    closes = df["close"].values; n = len(closes)
+    for q in Q_LIST:
+        arr = np.full(n, np.nan)
+        for i in range(WINDOW, n):
+            arr[i] = variance_ratio(closes[i - WINDOW:i], q)
+        df[f"vr{q}"] = arr
+    
+    short_cols = [f"vr{q}" for q in SHORT_Q]
+    long_cols = [f"vr{q}" for q in LONG_Q]
+    df["short_vr"] = df[short_cols].mean(axis=1)
+    df["long_vr"] = df[long_cols].mean(axis=1)
+    df["vr_score"] = 0.8 * (1 - df["long_vr"]) + 0.2 * (1 - df["short_vr"])
+    df["q20"] = df["vr_score"].rolling(ROLL_Q).quantile(0.20)
+    df["q40"] = df["vr_score"].rolling(ROLL_Q).quantile(0.40)
+    df["q60"] = df["vr_score"].rolling(ROLL_Q).quantile(0.60)
+    df["q80"] = df["vr_score"].rolling(ROLL_Q).quantile(0.80)
+    
+    # Regime5
+    def reg5(row):
+        if pd.isna(row["q20"]): return "neutral"
+        s = row["vr_score"]
+        if s <= row["q20"]: return "strong_mom"
+        elif s <= row["q40"]: return "mom"
+        elif s <= row["q60"]: return "neutral"
+        elif s <= row["q80"]: return "rev"
+        else: return "strong_rev"
+    df["regime5"] = df.apply(reg5, axis=1)
+    
+    # Momentum (normalized)
+    df["mom_val"] = df["close"] - df["close"].shift(MOM_LOOKBACK)
+    df["mom_5"] = df["close"] - df["close"].shift(5)
+    df["mom_20"] = df["close"] - df["close"].shift(20)
+    
+    # ATR
+    h, l, c = df["high"], df["low"], df["close"]
+    pc = c.shift(1)
+    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(ATR_LEN).mean()
+    df["atr_norm"] = df["atr"] / df["close"]
+    
+    # Normalized momentum & price position
+    df["mom_5_norm"] = df["mom_5"] / df["atr"]
+    df["mom_10_norm"] = df["mom_val"] / df["atr"]
+    df["mom_20_norm"] = df["mom_20"] / df["atr"]
+    df["bb_position"] = (df["close"] - df["lower_2"]) / (df["upper_2"] - df["lower_2"])
+    df["dist_ma_norm"] = (df["close"] - df["ma"]) / df["atr"]
+    
+    # Rolling std
+    df["log_ret"] = np.log(df["close"] / df["close"].shift(1))
+    df["rolling_std_20"] = df["log_ret"].rolling(20).std()
+    df["rolling_std_100"] = df["log_ret"].rolling(100).std()
+    
+    # Time features
+    df["hour_of_day"] = df["datetime"].dt.hour
+    df["day_of_week"] = df["datetime"].dt.dayofweek
+    
+    critical = ["ma", "upper_2", "lower_2", "atr", "vr_score", "q20",
+                "q40", "q60", "q80", "regime5", "mom_val", "vr16", "vr30",
+                "rolling_std_100", "bbw_percentile"]
+    return df.dropna(subset=critical).reset_index(drop=True)
+
+
+def extract_features_at_row(row, product, source_model, direction, entry_type):
+    """진입 시점의 feature 추출"""
+    return {
+        # 식별자
+        "product": product,
+        "source_model": source_model,
+        "entry_dt": row["datetime"],
+        "direction": direction,
+        "entry_type": entry_type,
+        "entry_price": row["close"],
+        "entry_atr": row["atr"],
+        
+        # A. VR 레짐
+        "vr_16": row["vr16"],
+        "vr_30": row["vr30"],
+        "short_vr": row["short_vr"],
+        "long_vr": row["long_vr"],
+        "vr_score": row["vr_score"],
+        "regime5_strong_mom": 1 if row["regime5"] == "strong_mom" else 0,
+        "regime5_mom": 1 if row["regime5"] == "mom" else 0,
+        "regime5_neutral": 1 if row["regime5"] == "neutral" else 0,
+        "regime5_rev": 1 if row["regime5"] == "rev" else 0,
+        "regime5_strong_rev": 1 if row["regime5"] == "strong_rev" else 0,
+        
+        # B. 변동성
+        "atr": row["atr"],
+        "atr_norm": row["atr_norm"],
+        "bbw": row["bbw"],
+        "bbw_percentile": row["bbw_percentile"],
+        "is_expansion": row["is_expansion"],
+        "walk_up": row["walk_up"],
+        "walk_down": row["walk_down"],
+        "rolling_std_20": row["rolling_std_20"],
+        "rolling_std_100": row["rolling_std_100"],
+        
+        # C. 가격 위치 / 모멘텀
+        "bb_position": row["bb_position"],
+        "dist_ma_norm": row["dist_ma_norm"],
+        "mom_5_norm": row["mom_5_norm"],
+        "mom_10_norm": row["mom_10_norm"],
+        "mom_20_norm": row["mom_20_norm"],
+        
+        # D. 시간
+        "hour_of_day": row["hour_of_day"],
+        "day_of_week": row["day_of_week"],
+    }
+
+
+# v1
+def model_v1_with_features(df, product):
+    """v1 모델 실행 + 진입 시점 feature 추출 + 거래 결과"""
+    pos, ep, sp, trail, m_pos = 0, 0.0, None, None, None
+    entry_features = None
+    trades = []
+    
+    rows = df.to_dict("records")
+    for i, row in enumerate(rows):
+        c = row["close"]; u = row["upper_2"]; l = row["lower_2"]
+        atr = row["atr"]; mom = row["mom_val"]; dt = row["datetime"]
+        vr_rev = row["vr16"] < V1_VR_LOWER and row["vr30"] < V1_VR_LOWER
+        vr_tr = row["vr16"] > V1_VR_UPPER and row["vr30"] > V1_VR_UPPER
+        bbw_long = row["is_expansion"] and row["walk_up"]
+        bbw_short = row["is_expansion"] and row["walk_down"]
+        
+        if pos == 0:
+            entry_type = None; direction = 0
+            if vr_rev:
+                if c < l:
+                    pos, ep, sp, m_pos = 1, c, c - STOP_ATR * atr, "rev"
+                    direction, entry_type = 1, "vr_rev"
+                elif c > u:
+                    pos, ep, sp, m_pos = -1, c, c + STOP_ATR * atr, "rev"
+                    direction, entry_type = -1, "vr_rev"
+            elif vr_tr:
+                if mom != 0:
+                    d = 1 if mom > 0 else -1
+                    pos, ep, m_pos, trail = d, c, "trend", c
+                    sp = c - d * STOP_ATR * atr
+                    direction, entry_type = d, "vr_trend"
+            elif bbw_long:
+                pos, ep, m_pos, trail = 1, c, "trend", c
+                sp = c - STOP_ATR * atr
+                direction, entry_type = 1, "bbw"
+            elif bbw_short:
+                pos, ep, m_pos, trail = -1, c, "trend", c
+                sp = c + STOP_ATR * atr
+                direction, entry_type = -1, "bbw"
+            
+            if pos != 0:
+                entry_features = extract_features_at_row(row, product, "v1", direction, entry_type)
+            continue
+        
+        raw = None
+        if pos == 1:
+            if m_pos == "rev":
+                if c <= sp or c >= u: raw = (c - ep) / ep
+            else:
+                trail = max(trail, c)
+                vr_tr_now = row["vr16"] > V1_VR_UPPER and row["vr30"] > V1_VR_UPPER
+                still = vr_tr_now or (row["is_expansion"] and row["walk_up"])
+                if c <= sp or c <= trail - V1_TRAIL_ATR * atr or not still: raw = (c - ep) / ep
+        elif pos == -1:
+            if m_pos == "rev":
+                if c >= sp or c <= l: raw = (ep - c) / ep
+            else:
+                trail = min(trail, c)
+                vr_tr_now = row["vr16"] > V1_VR_UPPER and row["vr30"] > V1_VR_UPPER
+                still = vr_tr_now or (row["is_expansion"] and row["walk_down"])
+                if c >= sp or c >= trail + V1_TRAIL_ATR * atr or not still: raw = (ep - c) / ep
+        
+        if raw is not None:
+            trade_return = raw - COST
+            entry_features["exit_dt"] = dt
+            entry_features["exit_price"] = c
+            entry_features["trade_return"] = trade_return
+            entry_features["y"] = 1 if trade_return > 0 else 0
+            trades.append(entry_features)
+            pos = 0
+            entry_features = None
+    
+    return trades
+
+
+# v4
+def model_v4_with_features(df, product):
+    """v4 모델 실행 + 진입 시점 feature 추출 + 거래 결과"""
+    pos, ep, sp, trail, m_pos, entry_reg = 0, 0.0, None, None, None, None
+    entry_features = None
+    trades = []
+    
+    rows = df.to_dict("records")
+    for i, row in enumerate(rows):
+        c = row["close"]; u = row["upper_2"]; l = row["lower_2"]
+        atr = row["atr"]; mom = row["mom_val"]; dt = row["datetime"]
+        reg = row["regime5"]
+        
+        if pos == 0:
+            entered = False; direction = 0; entry_type = None
+            if reg in ("strong_rev", "rev"):
+                if c < l:
+                    pos, ep, sp, m_pos, entry_reg = 1, c, c - STOP_ATR * atr, "rev", reg
+                    direction, entry_type, entered = 1, f"regime_{reg}", True
+                elif c > u:
+                    pos, ep, sp, m_pos, entry_reg = -1, c, c + STOP_ATR * atr, "rev", reg
+                    direction, entry_type, entered = -1, f"regime_{reg}", True
+            elif reg == "strong_mom" and row["is_expansion"]:
+                if row["walk_up"]:
+                    pos, ep, m_pos, trail, entry_reg = 1, c, "trend", c, reg
+                    sp = c - STOP_ATR * atr
+                    direction, entry_type, entered = 1, "strong_mom_bbw", True
+                elif row["walk_down"]:
+                    pos, ep, m_pos, trail, entry_reg = -1, c, "trend", c, reg
+                    sp = c + STOP_ATR * atr
+                    direction, entry_type, entered = -1, "strong_mom_bbw", True
+            if not entered and reg not in ("strong_rev", "rev", "strong_mom") and row["is_expansion"]:
+                if row["walk_up"]:
+                    pos, ep, m_pos, trail, entry_reg = 1, c, "trend", c, reg
+                    sp = c - STOP_ATR * atr
+                    direction, entry_type = 1, "bbw_other"
+                elif row["walk_down"]:
+                    pos, ep, m_pos, trail, entry_reg = -1, c, "trend", c, reg
+                    sp = c + STOP_ATR * atr
+                    direction, entry_type = -1, "bbw_other"
+            
+            if pos != 0:
+                entry_features = extract_features_at_row(row, product, "v4", direction, entry_type)
+            continue
+        
+        raw = None
+        if pos == 1:
+            if m_pos == "rev":
+                if c <= sp or c >= u: raw = (c - ep) / ep
+            else:
+                trail = max(trail, c)
+                still = (row["regime5"] == "strong_mom") or (row["is_expansion"] and row["walk_up"])
+                if c <= sp or c <= trail - V4_TRAIL_MOM * atr or not still: raw = (c - ep) / ep
+        elif pos == -1:
+            if m_pos == "rev":
+                if c >= sp or c <= l: raw = (ep - c) / ep
+            else:
+                trail = min(trail, c)
+                still = (row["regime5"] == "strong_mom") or (row["is_expansion"] and row["walk_down"])
+                if c >= sp or c >= trail + V4_TRAIL_MOM * atr or not still: raw = (ep - c) / ep
+        
+        if raw is not None:
+            trade_return = raw - COST
+            entry_features["exit_dt"] = dt
+            entry_features["exit_price"] = c
+            entry_features["trade_return"] = trade_return
+            entry_features["y"] = 1 if trade_return > 0 else 0
+            trades.append(entry_features)
+            pos = 0
+            entry_features = None
+            entry_reg = None
+    
+    return trades
+
+
+def main():
+    print("=" * 80)
+    print(" Feature Engineering - v1, v4 거래 추출 + ML feature")
+    print("=" * 80)
+    
+    all_trades = []
+    
+    for product, fn in FILES.items():
+        path = os.path.join(DATA_DIR, fn)
+        if not os.path.exists(path):
+            print(f" {path} 없음")
+            continue
+        
+        print(f"\n[{product}] 데이터 로드 준비중...")
+        df = pd.read_csv(path, parse_dates=["datetime"])
+        data = prep(df)
+        print(f"  prep 후 {len(data):,}봉")
+        
+        print(f"  v1 거래 추출...")
+        v1_trades = model_v1_with_features(data, product)
+        print(f"    {len(v1_trades)} 거래 (수익률 mean: {np.mean([t['trade_return'] for t in v1_trades])*100:.2f}%)")
+        all_trades.extend(v1_trades)
+        
+        print(f"  v4 거래 추출...")
+        v4_trades = model_v4_with_features(data, product)
+        print(f"    {len(v4_trades)} 거래 (수익률 mean: {np.mean([t['trade_return'] for t in v4_trades])*100:.2f}%)")
+        all_trades.extend(v4_trades)
+    
+    # DataFrame
+    features_df = pd.DataFrame(all_trades)
+    
+    # 정렬
+    features_df = features_df.sort_values("entry_dt").reset_index(drop=True)
+    
+    # 요약
+    print("\n" + "=" * 80)
+    print("요약본")
+    print("=" * 80)
+    print(f"  총 거래 수: {len(features_df):,}")
+    print(f"\n  종목별:")
+    for p in PRODUCTS:
+        sub = features_df[features_df["product"] == p]
+        if len(sub) > 0:
+            print(f"    {p}: {len(sub):>4} 거래 (성공률 {sub['y'].mean()*100:.1f}%)")
+    
+    print(f"\n  모델별:")
+    for m in ["v1", "v4"]:
+        sub = features_df[features_df["source_model"] == m]
+        if len(sub) > 0:
+            mean_ret = sub['trade_return'].mean() * 100
+            print(f"    {m}: {len(sub):>4} 거래 (성공률 {sub['y'].mean()*100:.1f}%, 평균수익 {mean_ret:+.3f}%)")
+    
+    print(f"\n  IS/OOS 분할 (entry_dt 기준):")
+    is_df = features_df[features_df["entry_dt"] < "2024-01-01"]
+    oos_df = features_df[features_df["entry_dt"] >= "2024-01-01"]
+    print(f"    IS  (2018-2023): {len(is_df):>4} 거래 (성공률 {is_df['y'].mean()*100:.1f}%)")
+    print(f"    OOS (2024-2026): {len(oos_df):>4} 거래 (성공률 {oos_df['y'].mean()*100:.1f}%)")
+    
+    print(f"\n  Feature 개수: {len(features_df.columns)} (식별자 + feature + 라벨)")
+    
+    # 저장
+    output_path = os.path.join(OUTPUT_DIR, "features.csv")
+    features_df.to_csv(output_path, index=False)
+    print(f"\n  저장: {output_path}")
+    
+    # NaN 체크
+    nan_cols = features_df.isna().sum()
+    nan_cols = nan_cols[nan_cols > 0]
+    if len(nan_cols) > 0:
+        print(f"\n NaN 있는 컬럼:")
+        for col, n in nan_cols.items():
+            print(f"    {col}: {n}개")
+    else:
+        print(f"\n NaN 없음")
+
+
+if __name__ == "__main__":
+    main()
